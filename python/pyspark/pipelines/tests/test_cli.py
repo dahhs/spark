@@ -19,6 +19,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch, Mock
 
 from pyspark.errors import PySparkException
 from pyspark.testing.connectutils import (
@@ -370,6 +371,103 @@ class CLIUtilityTests(ReusedConnectTestCase):
                     self.spark,
                     "test_graph_id",
                 )
+
+    def test_run_success(self):
+        """Happy path: run completes and stops the session."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            spec_path = Path(temp_dir) / "spark-pipeline.yaml"
+            mock_spec = PipelineSpec(
+                name="test",
+                storage="storage_path",
+                catalog=None,
+                database="test_db",
+                configuration={"k": "v"},
+                libraries=[],
+            )
+
+            with (
+                patch(
+                    "pyspark.pipelines.cli.load_pipeline_spec", return_value=mock_spec
+                ) as mock_load,
+                patch("pyspark.pipelines.cli.SparkSession.builder") as mock_builder,
+                patch(
+                    "pyspark.pipelines.cli.create_dataflow_graph",
+                    return_value="test_graph_id",
+                ) as mock_create,
+                patch("pyspark.pipelines.cli.SparkConnectGraphElementRegistry"),
+                patch("pyspark.pipelines.cli.register_definitions"),
+                patch("pyspark.pipelines.cli.start_run", return_value=iter([])) as mock_start,
+                patch("pyspark.pipelines.cli.handle_pipeline_events") as mock_handle,
+            ):
+                mock_spark = Mock()
+                mock_builder.config.return_value = mock_builder
+                mock_builder.getOrCreate.return_value = mock_spark
+
+                run(
+                    spec_path,
+                    full_refresh=[],
+                    full_refresh_all=True,
+                    refresh=[],
+                    dry=False,
+                )
+
+                mock_load.assert_called_once_with(spec_path)
+                mock_create.assert_called_once_with(
+                    mock_spark,
+                    default_catalog=None,
+                    default_database="test_db",
+                    sql_conf={"k": "v"},
+                )
+                mock_start.assert_called_once_with(
+                    mock_spark, "test_graph_id",
+                    full_refresh=[], full_refresh_all=True, refresh=[],
+                    dry=False, storage="storage_path",
+                )
+                mock_handle.assert_called_once_with(mock_start.return_value)
+                mock_spark.stop.assert_called_once()
+
+    def test_run_stops_spark_on_error(self):
+        """If an error occurs after session creation, spark.stop() is still called."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            spec_path = Path(temp_dir) / "spark-pipeline.yaml"
+            mock_spec = PipelineSpec(
+                name="test",
+                storage="storage_path",
+                catalog=None,
+                database="test_db",
+                configuration={},
+                libraries=[],
+            )
+            with (
+                patch("pyspark.pipelines.cli.load_pipeline_spec", return_value=mock_spec),
+                patch("pyspark.pipelines.cli.SparkSession.builder") as mock_builder,
+                patch(
+                    "pyspark.pipelines.cli.create_dataflow_graph",
+                    return_value="test_graph_id",
+                ),
+                patch("pyspark.pipelines.cli.SparkConnectGraphElementRegistry"),
+                patch(
+                    "pyspark.pipelines.cli.register_definitions",
+                    side_effect=RuntimeError("boom"),
+                ),
+                patch("pyspark.pipelines.cli.start_run"),
+                patch("pyspark.pipelines.cli.handle_pipeline_events"),
+            ):
+                mock_spark = Mock()
+                mock_builder.config.return_value = mock_builder
+                mock_builder.getOrCreate.return_value = mock_spark
+
+                with self.assertRaises(RuntimeError) as context:
+                    run(
+                        spec_path,
+                        full_refresh=[],
+                        full_refresh_all=False,
+                        refresh=[],
+                        dry=False,
+                    )
+
+                self.assertIn("boom", str(context.exception))
+                mock_spark.stop.assert_called_once()
 
     def test_full_refresh_all_conflicts_with_full_refresh(self):
         with tempfile.TemporaryDirectory() as temp_dir:
